@@ -16,13 +16,12 @@ from __future__ import annotations
 import json
 import urllib.request
 
+from pet.chat import providers as providers_mod
 from pet.chat.models import ProviderConfig
-from pet.chat.providers import (
-    OpenAICompatibleProvider,
-    _normalize_model_id,
-    _opencode_headers,
-    test_connection,
-)
+from pet.chat.providers import OpenAICompatibleProvider, _normalize_model_id, _opencode_headers
+
+# 注意：不能 `from pet.chat.providers import test_connection`——pytest 会把导入进来的
+# test_connection 也当成测试函数收集，然后因为缺 config 参数报 fixture 错误。
 
 OPENCODE_BASE = 'https://opencode.ai/zen/go/v1'
 DEEPSEEK_BASE = 'https://api.deepseek.com'
@@ -98,7 +97,7 @@ def test_opencode_session_id_is_stable():
 def test_test_connection_sends_session_header(monkeypatch):
     """「测试连接」也必须带上会话头，否则用户点测试只会看到 400。"""
     captured = _capture_request(monkeypatch)
-    ok, message = test_connection(_config())
+    ok, message = providers_mod.test_connection(_config())
     assert ok and '200' in message
     headers = _headers_of(captured['request'])
     assert headers['x-opencode-session'] == _opencode_headers(OPENCODE_BASE)['x-opencode-session']
@@ -108,7 +107,7 @@ def test_test_connection_sends_session_header(monkeypatch):
 def test_model_prefix_stripped_for_opencode(monkeypatch):
     """`opencode-go/deepseek-v4.1-flash` 发出去时必须还原成 `deepseek-v4.1-flash`。"""
     captured = _capture_request(monkeypatch)
-    test_connection(_config())
+    providers_mod.test_connection(_config())
     body = json.loads(captured['request'].data.decode('utf-8'))
     assert body['model'] == 'deepseek-v4.1-flash'
 
@@ -131,7 +130,7 @@ def test_stream_request_sends_session_and_naked_model(monkeypatch):
 def test_other_provider_untouched(monkeypatch):
     """非 opencode 的 provider：不补头、不改 model（回归护栏）。"""
     captured = _capture_request(monkeypatch)
-    test_connection(_config(base_url=DEEPSEEK_BASE, model='deepseek-chat'))
+    providers_mod.test_connection(_config(base_url=DEEPSEEK_BASE, model='deepseek-chat'))
     headers = _headers_of(captured['request'])
     assert 'x-opencode-session' not in headers
     body = json.loads(captured['request'].data.decode('utf-8'))
