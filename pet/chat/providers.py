@@ -1,6 +1,6 @@
 from __future__ import annotations
 import functools
-import json, ssl, threading, urllib.error, urllib.request
+import json, ssl, threading, urllib.error, urllib.request, uuid
 from collections.abc import Iterator
 from dataclasses import dataclass
 from datetime import datetime
@@ -62,13 +62,31 @@ def build_browser_headers(extra: dict | None = None) -> dict[str, str]:
     return headers
 
 
+# opencode Zen / Go 网关要求客户端自报会话 ID（缺失时直接 400 MissingSessionID，
+# 与 API Key 对错无关）。只对 opencode 域名生效，其它 provider 的请求头不变。
+_OPENCODE_SESSION_ID = uuid.uuid4().hex
+
+
+def _opencode_headers(base_url: str) -> dict[str, str]:
+    return {'x-opencode-session': _OPENCODE_SESSION_ID} if 'opencode.ai' in str(base_url or '').lower() else {}
+
+
+def _normalize_model_id(base_url: str, model: str) -> str:
+    """OpenCode 配置里的 `opencode-go/<id>` 在 HTTP 侧要还原成裸 `<id>`。"""
+    text = str(model or '')
+    if 'opencode.ai' in str(base_url or '').lower() and text.lower().startswith('opencode-go/'):
+        return text.split('/', 1)[1]
+    return text
+
+
 def test_connection(config, timeout: float = 10.0):
     """发送一个最小的非流式请求验证端点连通性（含 TLS 校验）。
     返回 (ok: bool, message: str)，供设置界面"测试连接"使用，不写入任何状态。"""
     try:
         endpoint = normalize_chat_endpoint(config.base_url, config.chat_path)
-        payload = {'model': config.model, 'messages': [{'role': 'user', 'content': 'ping'}], 'max_tokens': 1, 'stream': False}
+        payload = {'model': _normalize_model_id(config.base_url, config.model), 'messages': [{'role': 'user', 'content': 'ping'}], 'max_tokens': 1, 'stream': False}
         headers = build_browser_headers({'Content-Type': 'application/json'})
+        headers.update(_opencode_headers(config.base_url))
         if config.api_key: headers['Authorization'] = f'Bearer {config.api_key}'
         req = urllib.request.Request(endpoint, data=json.dumps(payload, ensure_ascii=False).encode('utf-8'), headers=headers, method='POST')
         with urllib.request.urlopen(req, timeout=timeout, context=_make_ssl_context(config.verify_ssl)) as resp:
@@ -212,7 +230,9 @@ class OpenAICompatibleProvider:
     def _open(self,payload,config,accept):
         endpoint=normalize_chat_endpoint(config.base_url,config.chat_path)
         headers=build_browser_headers({'Content-Type':'application/json','Accept':accept})
+        headers.update(_opencode_headers(config.base_url))
         if config.api_key: headers['Authorization']=f'Bearer {config.api_key}'
+        payload=dict(payload); payload['model']=_normalize_model_id(config.base_url,payload.get('model',config.model))
         req=urllib.request.Request(endpoint,data=json.dumps(payload,ensure_ascii=False).encode('utf-8'),headers=headers,method='POST')
         try: return urllib.request.urlopen(req,timeout=config.timeout,context=_make_ssl_context(config.verify_ssl))
         except urllib.error.HTTPError as exc:
