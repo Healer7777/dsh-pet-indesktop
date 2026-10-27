@@ -62,14 +62,16 @@ def translate_text(text: str, config, *, target: str | None = None) -> str:
     provider, _system_prompt = resolve_chat_context(config)
 
     # 延迟导入：无 Chat 变体（pet.chat 被排除）下本函数不会被调用
+    # 同 vision.py：直连请求必须自己补 opencode 网关要的会话头 / 还原 model id
     from ..chat.providers import (
-        _make_ssl_context, build_browser_headers, normalize_chat_endpoint,
+        _make_ssl_context, _normalize_model_id, _opencode_headers,
+        build_browser_headers, normalize_chat_endpoint,
     )
 
     target = _target_language(source) if target in (None, "", "auto") else str(target)
     endpoint = normalize_chat_endpoint(provider.base_url, provider.chat_path)
     payload = {
-        "model": provider.model,
+        "model": _normalize_model_id(provider.base_url, provider.model),
         "messages": [
             {"role": "system", "content": (
                 f"你是翻译引擎。把用户给的文本翻译成{target}。"
@@ -84,6 +86,7 @@ def translate_text(text: str, config, *, target: str | None = None) -> str:
         "max_tokens": max(1024, min(int(provider.max_tokens), 4096)),
     }
     headers = build_browser_headers({"Content-Type": "application/json"})
+    headers.update(_opencode_headers(provider.base_url))  # Go 网关：缺它会 400（鉴权之前）
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
 

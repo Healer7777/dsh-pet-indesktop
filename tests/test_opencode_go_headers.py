@@ -62,12 +62,12 @@ class _FakeResponse:
         return False
 
 
-def _capture_request(monkeypatch) -> dict:
+def _capture_request(monkeypatch, body: bytes = b'{"choices":[]}') -> dict:
     captured: dict = {}
 
     def fake_urlopen(request, timeout=None, context=None):
         captured['request'] = request
-        return _FakeResponse()
+        return _FakeResponse(body)
 
     monkeypatch.setattr(urllib.request, 'urlopen', fake_urlopen)
     return captured
@@ -142,3 +142,79 @@ def test_normalize_model_id_is_host_scoped():
     assert _normalize_model_id(OPENCODE_BASE, 'opencode-go/deepseek-v4.1-flash') == 'deepseek-v4.1-flash'
     assert _normalize_model_id(DEEPSEEK_BASE, 'opencode-go/deepseek-v4.1-flash') == 'opencode-go/deepseek-v4.1-flash'
     assert _normalize_model_id(OPENCODE_BASE, 'deepseek-v4.1-flash') == 'deepseek-v4.1-flash'
+
+
+# ---------------------------------------------------------------------------
+# 直连路径（不走 chat/providers）：识图、截图翻译都自己拼请求，必须自己补头。
+# 2026-10-27 回归：这两条路径漏了头 → Go 网关 400 MissingSessionID，聊天却正常。
+# ---------------------------------------------------------------------------
+
+_VISION_BODY = b'{"choices":[{"message":{"content":"ok"}}]}'
+
+
+def test_vision_request_sends_session_header_and_naked_model(monkeypatch):
+    """「看看屏幕 / 识图」的请求也要带会话头，model 也要还原成裸 id。"""
+    from pet import vision as vision_mod
+
+    captured = _capture_request(monkeypatch, _VISION_BODY)
+    reply = vision_mod.ask_about_screen(b'\xff\xd8\xff\xd9', 'app', 'sys', _config())
+    assert reply == 'ok'
+    headers = _headers_of(captured['request'])
+    assert headers['x-opencode-session']
+    body = json.loads(captured['request'].data.decode('utf-8'))
+    assert body['model'] == 'deepseek-v4.1-flash'
+    # Go 网关接受 ds 的关思考参数；不关的话 reasoning 会吃掉 4096 预算 → 空回复
+    assert body['thinking'] == {'type': 'disabled'}
+
+
+def test_vision_other_provider_untouched(monkeypatch):
+    """非 opencode 的视觉端点：不补头，DeepSeek 视觉模型映射保持原样。"""
+    from pet import vision as vision_mod
+
+    captured = _capture_request(monkeypatch, _VISION_BODY)
+    vision_mod.ask_about_screen(
+        b'\xff\xd8\xff\xd9', 'app', 'sys',
+        _config(base_url=DEEPSEEK_BASE, model='deepseek-chat'),
+    )
+    headers = _headers_of(captured['request'])
+    assert 'x-opencode-session' not in headers
+    body = json.loads(captured['request'].data.decode('utf-8'))
+    assert body['model'] == 'deepseek-v4-flash-vision-exp'
+
+
+def test_vision_model_mapping_is_host_scoped():
+    """`-vision-exp` 只属于 DeepSeek 官方 API；兼容端点必须直接用聊天模型。
+
+    2026-10-27 实测：opencode Go 上 deepseek-v4-flash-vision-exp 已废弃（400），
+    而 deepseek-v4.1-flash 本身吃图（返回"蓝色"）。
+    """
+    from pet import vision as vision_mod
+
+    assert vision_mod.resolve_vision_model(
+        _config(base_url=DEEPSEEK_BASE, model='deepseek-v4.1-flash')
+    ) == 'deepseek-v4-flash-vision-exp'
+    assert vision_mod.resolve_vision_model(
+        _config(model='deepseek-v4.1-flash')
+    ) == 'deepseek-v4.1-flash'
+    assert vision_mod.resolve_vision_model(_config(model='kimi-k3')) == 'kimi-k3'
+    # 设置里显式指定视觉模型时永远优先
+    assert vision_mod.resolve_vision_model(_config(
+        model='deepseek-v4.1-flash', vision_same_as_chat=False, vision_model='glm-5.3-flash',
+    )) == 'glm-5.3-flash'
+
+
+def test_translate_sends_session_header_and_naked_model(monkeypatch):
+    """截图翻译走聊天模型直连：同样补头 + 还原 model id。"""
+    from pet.screen_capture import translate as translate_mod
+    from pet.screen_capture import vision_bridge
+
+    captured = _capture_request(
+        monkeypatch,
+        json.dumps({'choices': [{'message': {'content': '你好'}}]}, ensure_ascii=False).encode('utf-8'),
+    )
+    monkeypatch.setattr(vision_bridge, 'resolve_chat_context', lambda _cfg: (_config(), 'sys'))
+    assert translate_mod.translate_text('hello', object()) == '你好'
+    headers = _headers_of(captured['request'])
+    assert headers['x-opencode-session']
+    body = json.loads(captured['request'].data.decode('utf-8'))
+    assert body['model'] == 'deepseek-v4.1-flash'

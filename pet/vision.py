@@ -76,18 +76,26 @@ class VisionError(RuntimeError):
 
 def resolve_vision_model(p) -> str:
     """推导视觉模型：取消「同聊天模型」且手填了就用filled值；
-    否则按聊天模型推导——本身多模态的直接用，ds 文本模型映射到预览版视觉模型。"""
+    否则按聊天模型推导——本身多模态的直接用，ds 文本模型映射到预览版视觉模型。
+
+    ⚠️ `-vision-exp` 是 **DeepSeek 官方 API 独有**的预览视觉模型。兼容端点
+    （如 opencode Zen/Go）没有它，映射过去只会 400「Model ... has been
+    deprecated」——所以这个映射只在 DeepSeek 官方域名下做；其它端点直接用
+    聊天模型（v4.1-flash 等本身吃图），真有独立视觉模型就用设置里的 vision_model。"""
     if not p.vision_same_as_chat and p.vision_model.strip():
         return p.vision_model.strip()
     m = (p.model or '').strip()
     low = m.lower()
     if 'vision' in low:
         return m
-    if low.endswith('deepseek-v4-flash'):
-        return m + '-vision-exp'
-    if low.startswith('deepseek'):
+    base = (
+        p.base_url if p.vision_same_as_chat else (p.vision_base_url or p.base_url)
+    ) or ''
+    if 'deepseek' in base.lower() and low.startswith('deepseek'):
+        if low.endswith('deepseek-v4-flash'):
+            return m + '-vision-exp'
         return DEFAULT_VISION_MODEL
-    return m  # kimi 等本身多模态的模型直接用聊天模型
+    return m  # 第三方兼容端点 / kimi 等本身多模态的模型直接用聊天模型
 
 
 def foreground_window_info() -> dict | None:
@@ -328,8 +336,15 @@ def _post_vision_request(
     已耗尽，函数直接抛出 VisionError 停止后续重试。
     pet_name: 可选，桌宠角色显示名；用于在 user 文本里追加自我识别提示，
     让模型认出截图角落里的桌宠就是自己，而不是陌生程序。"""
-    # 延迟导入：无 Chat 变体（pet.chat 被排除）下本函数不会被调用
-    from .chat.providers import _make_ssl_context, normalize_chat_endpoint, build_browser_headers
+    # 延迟导入：无 Chat 变体（pet.chat 被排除）下本函数不会被调用。
+    # _opencode_headers / _normalize_model_id：opencode Zen/Go 网关在鉴权之前就校验
+    # `x-opencode-session`，缺了直接 400。本函数是**独立于 chat/providers 的直连
+    # 请求**，必须自己补头、自己还原 model id——否则聊天正常、识图全挂
+    # （P-20261027-01）。以后新增直连 provider 的路径也走同一对助手，别再手拼头。
+    from .chat.providers import (
+        _make_ssl_context, _normalize_model_id, _opencode_headers,
+        build_browser_headers, normalize_chat_endpoint,
+    )
     # 视觉独立端点仅在「不同聊天模型」时生效；同聊天模型时强制跟随聊天配置，
     # 否则残留的 GLM 地址会配上 ds 的模型名发出（modelCode 不存在）
     base_url = p.base_url if p.vision_same_as_chat else (p.vision_base_url or p.base_url)
@@ -365,7 +380,8 @@ def _post_vision_request(
     else:
         messages = messages_override
     payload = {
-        'model': resolve_vision_model(p),
+        # opencode 配置里允许写 `opencode-go/<id>`，HTTP 侧要还原成裸 id
+        'model': _normalize_model_id(base_url, resolve_vision_model(p)),
         'messages': messages,
         'stream': False,
         'temperature': p.temperature,
@@ -374,10 +390,15 @@ def _post_vision_request(
         'max_tokens': max(4096, min(int(p.max_tokens), 8192)),
     }
     model_name = payload['model']
-    if model_name.lower().startswith('deepseek') and 'deepseek' in base_url.lower():
-        # ds 视觉模型默认开推理（思考十几秒才说话），关掉后 1~2 秒直答
+    # ds 视觉模型默认开推理（思考十几秒才说话）。关闭思考的参数是 ds 系扩展：
+    # 只在确定接受它的端点发（官方 API + opencode 网关，后者实测 reasoning=None）。
+    if model_name.lower().startswith('deepseek') and any(
+        host in base_url.lower() for host in ('deepseek', 'opencode.ai')
+    ):
+        # 关掉后 1~2 秒直答；不关时 4096 预算可能被 reasoning 吃光 → 空回复
         payload['thinking'] = {'type': 'disabled'}
     headers = build_browser_headers({'Content-Type': 'application/json'})
+    headers.update(_opencode_headers(base_url))  # Go 网关：缺它会 400（鉴权之前）
     # 安全（高优先）：独立视觉端点（vision_same_as_chat=False）绝不能把聊天 Key
     # 一起发过去。只有与聊天同模型时才允许复用聊天 Key；独立端点只认视觉自己的
     # Key（含钥匙串解析），缺失时直接报错，绝不回退到聊天 Key。
